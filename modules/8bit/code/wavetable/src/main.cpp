@@ -13,13 +13,10 @@
 #define TOGGLE_PIN PIN_PA4
 #define TOGGLE_LED PIN_PA5
 
-// Sawtooth wave parameters
-#define DEFAULT_SAWTOOTH_FREQ 100 // Default sawtooth wave frequency
-#define DAC_MAX_VALUE 255 // 8-bit DAC max value
 #define TIMER_FREQ 10000000 // 10MHz (20MHz / 2)
 #define MAX_FREQ 1000 // Maximum frequency in Hz
-#define MIN_FREQ 200  // Minimum frequency in Hz
-#define OCTAVE_DIVIDER 2 // Divider for one octave down
+#define MIN_FREQ 20  // Minimum frequency in Hz
+#define FOLD_MIN 128 // The max value to fold - half the full range
 
 // CV control parameters
 #define CV_THRESHOLD 5 // Threshold for CV value changes (0-1023)
@@ -40,19 +37,14 @@ volatile uint16_t currentFrequency = 440;
 volatile uint16_t pendingFrequency = 0; // New frequency to be applied at the next cycle
 volatile bool frequencyChangeRequested = false; // Flag for frequency change
 
-// Variables for octave-down sawtooth wave generation (TCB1)
-volatile uint16_t sawtoothStepOctaveDown = 0;
-volatile uint16_t sawtoothStepOctaveDownWithVolume = 0;
-volatile uint16_t sawtoothMaxStepOctaveDown = DAC_MAX_VALUE;
-volatile uint16_t currentFrequencyOctaveDown = DEFAULT_SAWTOOTH_FREQ / OCTAVE_DIVIDER;
-
+volatile uint8_t fold_level = 255;
+uint8_t *table = saw_table;
 // Variables for CV control
 uint16_t lastCVValue = 0;
 uint16_t lastCV2Value = 0;
-uint8_t octaveDownVolume = 128; // Default volume (0-255, where 255 is full volume)
 
 // Mode control variables
-bool midControlMode = true; // true = MIDI control, false = CV1 control
+bool midControlMode = false; // true = MIDI control, false = CV1 control
 
 // Function to update the main wave frequency
 void setFrequency(uint16_t frequency) {
@@ -83,20 +75,6 @@ void setFrequency(uint16_t frequency) {
     // 234Hz signal with CCMP = 1
     //step_size = 2;
     TCB0.CCMP = (uint16_t)timerPeriod;
-    
-    // Also update the octave-down frequency
-    //currentFrequencyOctaveDown = frequency / OCTAVE_DIVIDER;
-    //uint32_t timerPeriodOctaveDown = TIMER_FREQ / (currentFrequencyOctaveDown * 256UL);
-    
-    // Ensure timer period is at least 1 to prevent timer from getting stuck
-    //if (timerPeriodOctaveDown < 1) timerPeriodOctaveDown = 1;
-    
-    //TCB1.CCMP = (uint16_t)timerPeriodOctaveDown;
-}
-
-// Get the current sawtooth wave frequency
-uint16_t getSawtoothFrequency() {
-    return currentFrequency;
 }
 
 // Update frequency based on CV1 input
@@ -128,7 +106,7 @@ void updateFrequencyFromCV() {
 }
 
 // Update volume of octave-down sawtooth based on CV2 input
-void updateVolumeFromCV2() {    
+void updateFoldFromCV2() {    
     // Read CV2 (0-1023)
     uint16_t rawCV2 = analogRead(PIN_CV2);
     
@@ -136,9 +114,7 @@ void updateVolumeFromCV2() {
     if (abs((int)rawCV2 - (int)lastCV2Value) > CV_THRESHOLD) {
         // Save the current CV2 value
         lastCV2Value = rawCV2;
-        
-        // Map the CV2 value (0-1023) to volume range (0-255)
-        octaveDownVolume = map(rawCV2, 0, 1023, 0, 255);
+        fold_level = map(rawCV2, 0, 1023, FOLD_MIN, 255);
     }
 }
 
@@ -147,30 +123,12 @@ void setupTimers() {
     TCB0.CTRLA = TCB_CLKSEL_CLKDIV2_gc; // Clock div by 2 (10MHz)
     TCB0.CTRLB = TCB_CNTMODE_INT_gc;    // Timer interrupt mode
     TCB0.INTCTRL = TCB_CAPT_bm;         // Enable capture interrupt
-    
-    // Set initial frequency directly for TCB0
-    uint32_t timerPeriod = TIMER_FREQ / (DEFAULT_SAWTOOTH_FREQ * 256UL);
-    TCB0.CCMP = 1;// (uint16_t)timerPeriod;
-    currentFrequency = DEFAULT_SAWTOOTH_FREQ;
-    
-    // Configure TCB1 for octave-down sawtooth wave generation
-    TCB1.CTRLA = TCB_CLKSEL_CLKDIV2_gc; // Clock div by 2 (10MHz)
-    TCB1.CTRLB = TCB_CNTMODE_INT_gc;    // Timer interrupt mode
-    TCB1.INTCTRL = TCB_CAPT_bm;         // Enable capture interrupt
-    
-    // Set initial frequency for TCB1 (one octave down)
-    currentFrequencyOctaveDown = DEFAULT_SAWTOOTH_FREQ / OCTAVE_DIVIDER;
-    uint32_t timerPeriodOctaveDown = TIMER_FREQ / (currentFrequencyOctaveDown * 256UL);
-    TCB1.CCMP = (uint16_t)timerPeriodOctaveDown;
-    
-    // Reset sawtooth wave states
-    //sawtoothStep = 0;
+
+    setFrequency(MIN_FREQ);
     step = 0;
-    sawtoothStepOctaveDown = 0;
     
     // Enable the timers
     TCB0.CTRLA |= TCB_ENABLE_bm;
-    TCB1.CTRLA |= TCB_ENABLE_bm;
     
     sei(); // Enable global interrupts
 }
@@ -195,42 +153,19 @@ ISR(TCB0_INT_vect) {
     }
     step += step_size;
     step = step % 1024;
-    // Update sawtooth wave value
-    // sawtoothStep++;
-    // if (sawtoothStep > sawtoothMaxStep) {
-    //     sawtoothStep = 0; // Reset to start a new ramp
-    //}
     
-    // Mix the main sawtooth with the volume-adjusted octave-down sawtooth
-    //uint16_t combinedValue = (sawtoothStep + sawtoothStepOctaveDownWithVolume) / 2;
     // 1Hz wave needs 1024Hz sampling rate with 1024 samples
     // 1024 samples per second = 1 sample every 1ms
     // 1000Hz wave = 1 sample ever 1us
     // frequency * nsamples = samples / sec
     // time = frequency * 1/nsamples
     // Update DAC directly from the ISR for consistent timing
-    DAC0.DATA = sin_table[step];// + sin_table[step/2]) / 2; //combinedValue;
+    if (table[step] > fold_level)
+      DAC0.DATA = fold_level - (table[step] - fold_level);// + sin_table[step/2]) / 2; //combinedValue;
+    else
+      DAC0.DATA = table[step];
     //DAC0.DATA = (uint8_t)(((step * lastCVValue) / 256) % 256); //sin_table[step]; //combinedValue;
     //DAC0.DATA = sin_table[((step * lastCVValue) / 256) % 1024]; //sin_table[step]; //combinedValue;
-}
-
-// TCB1 Interrupt Service Routine (Octave-down sawtooth wave)
-ISR(TCB1_INT_vect) {
-    // Clear the interrupt flag immediately
-    TCB1.INTFLAGS = TCB_CAPT_bm;
-    
-    // Update octave-down sawtooth wave value
-    sawtoothStepOctaveDown++;
-    if (sawtoothStepOctaveDown > sawtoothMaxStepOctaveDown) {
-        sawtoothStepOctaveDown = 0; // Reset to start a new ramp
-    }
-    
-    // Combine both waveforms and send to DAC
-    // Apply volume control to octave-down sawtooth using integer math
-    // Scale octaveDownVolume from 0-255 to 0-1 fraction using integer division
-   sawtoothStepOctaveDownWithVolume = (sawtoothStepOctaveDown * octaveDownVolume) >> 8;
-
-    // Note: We don't update the DAC here, that's done in the TCB0 ISR
 }
 
 // Callback functions for MIDI events
@@ -324,6 +259,6 @@ void loop() {
   updateFrequencyFromCV();
   
   // Update volume based on CV2 (always active regardless of mode)
-  updateVolumeFromCV2();
+  updateFoldFromCV2();
 }
 
